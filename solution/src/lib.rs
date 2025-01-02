@@ -1,7 +1,9 @@
-use std::collections::HashMap;
-use std::time::SystemTime;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime};
 
-use module_system::{Handler, ModuleRef, System};
+use module_system::{Handler, ModuleRef, System, TimerHandle};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 pub use domain::*;
 
@@ -10,19 +12,15 @@ mod domain;
 #[non_exhaustive]
 pub struct Raft {
     id: Uuid,
-    term: u64,
     role: Role,
-    leader: Option<Uuid>,
-    other_nodes: Vec<Uuid>,
-    voted_for: Option<Uuid>,
-    log: Vec<LogEntry>,
-    commit_idx: usize,
-    last_applied: usize,
-    next_idx: HashMap<Uuid, usize>,
-    match_idx: HashMap<Uuid, usize>,
-    message_sender: Box<dyn RaftSender>,
-    stable_storage: Box<dyn StableStorage>,
-    state_machine: Box<dyn StateMachine>,
+    persistent_state: PersistentState,
+    volatile_state: VolatileState,
+    election_timer_handle: Option<TimerHandle>,
+
+    storage: Box<dyn StableStorage>,
+    sender: Box<dyn RaftSender>,
+    processes_count: usize,
+    other_nodes: Vec<Uuid>
 }
 
 impl Raft {
@@ -37,40 +35,49 @@ impl Raft {
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> {
         let mut other_nodes = Vec::new();
-        for node in config.servers {
-            if node != config.self_id {
-                other_nodes.push(node);
+        for node in config.servers.iter() {
+            if *node != config.self_id {
+                other_nodes.push(node.clone());
             }
         }
 
-        let module = Self {
-            id: config.self_id,
-            term: 0,
-            role: Role::Follower,
-            leader: None,
-            other_nodes,
-            voted_for: None,
-            log: vec![],
-            commit_idx: 0,
-            last_applied: 0,
-            next_idx: Default::default(),
-            match_idx: Default::default(),
-            message_sender,
-            stable_storage,
-            state_machine,
+        let persistent_state = if let Some(state) = stable_storage.get("persistent_state").await {
+            bincode::deserialize(&state).unwrap()
+        } else {
+            PersistentState::default()
         };
 
-        system.register_module(module).await
+        let module = Raft {
+            id: config.self_id,
+            role: Role::Follower,
+            persistent_state,
+            volatile_state: Default::default(),
+            election_timer_handle: None,
+            storage: stable_storage,
+            sender: message_sender,
+            processes_count: config.servers.len(),
+            other_nodes,
+        };
+
+        let mod_ref = system.register_module(module).await;
+        mod_ref.request_tick(ElectionTimeout { }, rand::thread_rng().gen_range(config.election_timeout_range)).await;
+        mod_ref
     }
 }
 
 #[async_trait::async_trait]
 impl Handler<RaftMessage> for Raft {
     async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: RaftMessage) {
+        if msg.header.term > self.persistent_state.current_term {
+            self.update_term(msg.header.term).await;
+            self.role = Role::Follower;
+        }
+
         match msg.content {
             RaftMessageContent::AppendEntries(_) => {todo!()}
             RaftMessageContent::AppendEntriesResponse(_) => {todo!()}
-            RaftMessageContent::RequestVote(_) => {todo!()}
+            RaftMessageContent::RequestVote(args) =>
+                self.handle_request_vote(msg.header.source, msg.header.term, args).await,
             RaftMessageContent::RequestVoteResponse(_) => {todo!()}
             _ => { todo!() }
         }
@@ -80,7 +87,7 @@ impl Handler<RaftMessage> for Raft {
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: ClientRequest) {
-        match msg.content {
+        /*match msg.content {
             ClientRequestContent::Command { command, client_id, sequence_num, lowest_sequence_num_without_response } => {
                 if let Role::Leader = self.role {
                     let prev_log_index = self.log.len();
@@ -131,12 +138,96 @@ impl Handler<ClientRequest> for Raft {
                 }
             }
             _ => {todo!()}
+        }*/
+        todo!()
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<ElectionTimeout> for Raft {
+    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: ElectionTimeout) {
+        todo!()
+    }
+}
+
+impl Raft {
+    async fn update_term(&mut self, new_term: u64) {
+        self.persistent_state.current_term = new_term;
+        self.persistent_state.voted_for = None;
+        self.persistent_state.leader_id = None;
+    }
+
+    async fn update_state(&mut self) {
+        self.storage.put("persistent_state", &bincode::serialize(&self.persistent_state).unwrap()).await.unwrap();
+    }
+
+    async fn handle_request_vote(&mut self, sender: Uuid, term: u64, args: RequestVoteArgs) {
+        let Role::Follower = self.role else {
+            self.sender.send(&sender, self.gen_request_vote_response(false)).await;
+            return;
+        };
+
+        if term < self.persistent_state.current_term {
+            self.sender.send(&sender, self.gen_request_vote_response(false)).await;
+            return;
+        }
+
+        if self.persistent_state.voted_for.is_some_and(|v| v != sender) {
+            self.sender.send(&sender, self.gen_request_vote_response(false)).await;
+            return;
+        }
+
+        let last_log_term = self.persistent_state.log.last().unwrap().term;
+        let last_log_index = self.persistent_state.log.len();
+
+        if args.last_log_term.cmp(&last_log_term).then(args.last_log_index.cmp(&last_log_index)).is_lt() {
+            self.sender.send(&sender, self.gen_request_vote_response(false)).await;
+            return;
+        }
+
+        self.persistent_state.voted_for = Some(sender);
+        self.sender.send(&sender, self.gen_request_vote_response(true)).await;
+    }
+}
+
+impl Raft {
+    fn gen_request_vote_response(&self, response: bool) -> RaftMessage {
+        RaftMessage {
+            header: RaftMessageHeader {
+                source: self.id,
+                term: self.persistent_state.current_term
+            },
+            content: RaftMessageContent::RequestVoteResponse(
+                RequestVoteResponseArgs { vote_granted: response }
+            )
         }
     }
 }
 
 enum Role {
     Follower,
-    Candidate,
-    Leader
+    Candidate {
+        votes_received: HashSet<Uuid>,
+    },
+    Leader {
+        next_idx: HashMap<Uuid, usize>,
+        match_idx: HashMap<Uuid, usize>,
+    },
 }
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct PersistentState {
+    current_term: u64,
+    voted_for: Option<Uuid>,
+    leader_id: Option<Uuid>,
+    log: Vec<LogEntry>
+}
+
+#[derive(Clone, Default)]
+struct VolatileState {
+    commit_idx: usize,
+    last_applied: usize
+}
+
+#[derive(Clone)]
+struct ElectionTimeout { }
